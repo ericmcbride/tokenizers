@@ -12,7 +12,6 @@
 use crate::utils::iter::ResultShunt;
 pub use crate::utils::padding::{pad_encodings, PaddingDirection, PaddingParams, PaddingStrategy};
 pub use crate::utils::truncation::{truncate_encodings, TruncationParams, TruncationStrategy};
-use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
@@ -91,8 +90,6 @@ pub trait Decoder: Send + Sync {
 /// A `Trainer` has the responsibility to train a model. We feed it with lines/sentences
 /// and it returns a `Model` when done.
 pub trait Trainer: Sync {
-    /// Whether we should show progress during the training.
-    fn should_show_progress(&self) -> bool;
     /// The actual training method. This will return a new trained Model as well as a list
     /// of `special_tokens` to be added directly to the tokenizer along with the model.
     fn train(&self, words: HashMap<String, u32>) -> Result<(Box<dyn Model>, Vec<AddedToken>)>;
@@ -559,23 +556,12 @@ impl Tokenizer {
     /// Train a model and replace our current Model, using the given Trainer
     #[allow(clippy::borrowed_box)]
     pub fn train(&mut self, trainer: &Box<dyn Trainer>, files: Vec<String>) -> Result<()> {
-        let progress = ProgressBar::new(100 * files.len() as u64);
-        progress.set_style(
-            ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] {msg:<40!} {wide_bar} {percent:>19!}"),
-        );
-        progress.set_message("Reading files");
-
         let results = files
             .into_par_iter()
             .map(|filename| -> Result<HashMap<String, u32>> {
                 let mut words = HashMap::new();
                 let file = File::open(filename)?;
-                let len = file.metadata().map_or(0, |c| c.len());
                 let mut file = BufReader::new(file);
-                let mut prev_prog = 0;
-                let mut read = 0;
-                let mut curr_prog;
 
                 let mut buf = String::new();
                 loop {
@@ -584,20 +570,13 @@ impl Tokenizer {
                     // on purpose. We want to keep the `\n` and potential `\r` between each lines
                     match file.read_line(&mut buf)? {
                         0 => break,
-                        b => {
+                        _ => {
                             let mut normalized = self.do_normalize(NormalizedString::from(&buf))?;
                             let pre_tokenized = self.pre_tokenize(&mut normalized)?;
                             trainer.process_tokens(
                                 &mut words,
                                 pre_tokenized.into_iter().map(|(t, _)| t).collect(),
                             );
-
-                            read += b as u64;
-                            curr_prog = ((read as f64 / len as f64) * 100.0) as u64;
-                            if curr_prog > prev_prog {
-                                progress.inc(curr_prog - prev_prog);
-                                prev_prog = curr_prog;
-                            }
                         }
                     }
                 }
@@ -605,7 +584,6 @@ impl Tokenizer {
                 Ok(words)
             })
             .collect::<Vec<_>>();
-        progress.finish();
 
         let mut words = HashMap::new();
         for result in results {
